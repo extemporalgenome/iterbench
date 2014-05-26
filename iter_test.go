@@ -5,10 +5,25 @@ import (
 	"testing"
 )
 
+const n = 16 << 10
+
 type (
-	Item interface{}
-	Iter func(more bool) (item Item, next Iter)
+	Iter     func() (int, Iter)
+	IterFunc func(int)
+	IterCh   <-chan int
 )
+
+var (
+	Slice = make([]int, n)
+	Map   = make(map[int]struct{}, n)
+)
+
+func init() {
+	for i := range Slice {
+		Slice[i] = i
+		Map[i] = struct{}{}
+	}
+}
 
 func IntSliceIter(s []int) Iter {
 	if len(s) == 0 {
@@ -18,7 +33,7 @@ func IntSliceIter(s []int) Iter {
 		f Iter
 		i int
 	)
-	f = func(more bool) (item Item, next Iter) {
+	f = func() (item int, next Iter) {
 		item = s[i]
 		i++
 		if i < len(s) {
@@ -29,25 +44,19 @@ func IntSliceIter(s []int) Iter {
 	return f
 }
 
-func IntSliceCall(s []int, f func(Item) (more bool)) {
+func IntSliceCall(s []int, f IterFunc) {
 	for _, v := range s {
-		if !f(v) {
-			break
-		}
+		f(v)
 	}
 }
 
-func IntSliceChan(s []int, done <-chan bool) <-chan Item {
-	ch := make(chan Item)
+func IntSliceChan(s []int) IterCh {
+	ch := make(chan int)
 	go func() {
-		defer close(ch)
 		for _, v := range s {
-			select {
-			case <-done:
-				return
-			case ch <- v:
-			}
+			ch <- v
 		}
+		close(ch)
 	}()
 	return ch
 }
@@ -56,30 +65,19 @@ func IntKeyIter(m map[int]struct{}) Iter {
 	if len(m) == 0 {
 		return nil
 	}
-	var (
-		f    Iter
-		ch   = make(chan Item)
-		done = make(chan bool)
-	)
+	ch := make(chan int)
 	go func() {
-		defer close(ch)
 		for k := range m {
-			select {
-			case <-done:
-				return
-			case ch <- k:
-			}
+			ch <- k
 		}
+		close(ch)
 	}()
-	lookahead := <-ch
-	f = func(more bool) (Item, Iter) {
-		if !more {
-			close(done)
-			return nil, nil
-		}
-		var item Item
-		item, lookahead = lookahead, <-ch
-		if lookahead == nil {
+	var f Iter
+	look, ok := <-ch
+	f = func() (item int, next Iter) {
+		item = look
+		look, ok = <-ch
+		if !ok {
 			return item, nil
 		}
 		return item, f
@@ -87,138 +85,155 @@ func IntKeyIter(m map[int]struct{}) Iter {
 	return f
 }
 
-func IntKeyCall(m map[int]struct{}, f func(Item) (more bool)) {
+func IntKeyCall(m map[int]struct{}, f IterFunc) {
 	for k := range m {
-		if !f(k) {
-			break
-		}
+		f(k)
 	}
 }
 
-func IntKeyChan(m map[int]struct{}, done <-chan bool) <-chan Item {
-	ch := make(chan Item)
+func IntKeyChan(m map[int]struct{}) IterCh {
+	ch := make(chan int)
 	go func() {
-		defer close(ch)
 		for k := range m {
-			select {
-			case <-done:
-				return
-			case ch <- k:
-			}
+			ch <- k
 		}
+		close(ch)
 	}()
 	return ch
 }
 
-func Expand(next Iter) []Item {
-	var (
-		s []Item
-		v Item
-	)
-	for next != nil {
-		v, next = next(true)
-		s = append(s, v)
+func CheckKeySlice(s []int) bool {
+	if len(s) != n {
+		return false
 	}
-	return s
-}
-
-type intItemSlice []Item
-
-func (s intItemSlice) Len() int           { return len(s) }
-func (s intItemSlice) Less(i, j int) bool { return s[i].(int) < s[j].(int) }
-func (s intItemSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
-
-const n = 1 << 10
-
-var (
-	s []int
-	m map[int]struct{}
-)
-
-func init() {
-	s = make([]int, n)
-	m = make(map[int]struct{}, n)
-	for i := range s {
-		v := n - i
-		s[i] = v
-		m[v] = struct{}{}
+	sort.Ints(s)
+	for i, v := range s {
+		if i != v {
+			return false
+		}
 	}
+	return true
 }
 
 func TestIntSliceIter(t *testing.T) {
-	item, next := Item(nil), IntSliceIter(s)
+	v, next := 0, IntSliceIter(Slice)
 	for i := 0; next != nil; i++ {
-		item, next = next(true)
-		if item != n-i {
+		v, next = next()
+		if v != i {
 			t.FailNow()
 		}
 	}
 }
 
-func TestIntKey(t *testing.T) {
-	s := Expand(IntKeyIter(m))
-	sort.Sort(sort.Reverse(intItemSlice(s)))
-	for i, item := range s {
-		if item != n-i {
+func TestIntSliceCall(t *testing.T) {
+	i := 0
+	IntSliceCall(Slice, func(v int) {
+		if v != i {
 			t.FailNow()
 		}
+		i++
+	})
+}
+
+func TestIntSliceChan(t *testing.T) {
+	i := 0
+	for v := range IntSliceChan(Slice) {
+		if v != i {
+			t.FailNow()
+		}
+		i++
+	}
+}
+
+func TestIntKeyIter(t *testing.T) {
+	var (
+		next = IntKeyIter(Map)
+		s    []int
+		v    int
+	)
+	for next != nil {
+		v, next = next()
+		s = append(s, v)
+	}
+	if !CheckKeySlice(s) {
+		t.FailNow()
+	}
+}
+
+func TestIntKeyCall(t *testing.T) {
+	var s []int
+	IntKeyCall(Map, func(v int) {
+		s = append(s, v)
+	})
+	if !CheckKeySlice(s) {
+		t.FailNow()
+	}
+}
+
+func TestIntKeyChan(t *testing.T) {
+	var s []int
+	for v := range IntKeyChan(Map) {
+		s = append(s, v)
+	}
+	if !CheckKeySlice(s) {
+		t.FailNow()
 	}
 }
 
 func BenchmarkIntSliceLoop(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		for _ = range s {
+		for _ = range Slice {
 		}
 	}
 }
 
 func BenchmarkIntSliceIter(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		next := IntSliceIter(s)
+		next := IntSliceIter(Slice)
 		for next != nil {
-			_, next = next(true)
+			_, next = next()
 		}
 	}
 }
 
 func BenchmarkIntSliceCall(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		IntSliceCall(s, func(Item) bool { return true })
+		IntSliceCall(Slice, func(int) {})
 	}
 }
 
 func BenchmarkIntSliceChan(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		for _ = range IntSliceChan(s, nil) {
+		for _ = range IntSliceChan(Slice) {
 		}
 	}
 }
 
 func BenchmarkIntKeyLoop(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		for _ = range m {
+		for _ = range Map {
 		}
 	}
 }
 
 func BenchmarkIntKeyIter(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		next := IntKeyIter(m)
+		next := IntKeyIter(Map)
 		for next != nil {
-			_, next = next(true)
+			_, next = next()
 		}
 	}
 }
 
 func BenchmarkIntKeyCall(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		IntKeyCall(m, func(Item) bool { return true })
+		IntKeyCall(Map, func(int) {})
 	}
 }
 
 func BenchmarkIntKeyChan(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		for _ = range IntKeyChan(m, nil) {
+		for _ = range IntKeyChan(Map) {
 		}
 	}
 }
